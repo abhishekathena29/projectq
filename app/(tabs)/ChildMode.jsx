@@ -41,6 +41,18 @@ export default function ChildMode() {
     }
   };
 
+  // Fire-and-forget TTS that never throws. On Linux (Pi), Firefox/Chromium
+  // route Web Speech through speech-dispatcher, which is frequently
+  // misconfigured and raises errors we don't want to crash the UI.
+  const safeSpeak = (text, options) => {
+    if (!text || !isWebTtsAvailable()) return;
+    try {
+      Speech.speak(text, options || {});
+    } catch (err) {
+      console.warn("Speech.speak failed:", err?.message || err);
+    }
+  };
+
   // Speak `text`, then run `afterSpeak`. If TTS is unavailable or its
   // `onDone` callback never arrives within a sensible window, fall back so
   // the audio still plays.
@@ -85,7 +97,7 @@ export default function ChildMode() {
 
   useEffect(() => {
     if (tasks.length > 0) {
-      Speech.speak(`Your first task is ${tasks[0].title}`);
+      safeSpeak(`Your first task is ${tasks[0].title}`);
     }
   }, [tasks]);
 
@@ -228,9 +240,9 @@ export default function ChildMode() {
         setCurrentActivityIndex(currentActivityIndex + 1);
       } else {
         // Schedule completed
-        Speech.speak("Great job! You've completed the schedule!", {
+        safeSpeak("Great job! You've completed the schedule!", {
           rate: 0.9,
-          pitch: 1.1
+          pitch: 1.1,
         });
         setIsScheduleRunning(false);
         setActiveSchedule(null);
