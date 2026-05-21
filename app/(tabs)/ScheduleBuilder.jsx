@@ -66,6 +66,10 @@ export default function ScheduleBuilder() {
   const [recordingUri, setRecordingUri] = useState(null);
   const [isUploading, setIsUploading] = useState(false);
   const recordingRef = useRef(null); // single source of truth for active recording
+  // Web-only: MediaRecorder + stream + collected chunks. On native this is unused.
+  const webRecorderRef = useRef(null);
+  const webStreamRef = useRef(null);
+  const webChunksRef = useRef([]);
   const [showTimePicker, setShowTimePicker] = useState(false);
   const [timePickerTarget, setTimePickerTarget] = useState(null); // 'selectedStep' or 'newStep'
 
@@ -385,8 +389,9 @@ export default function ScheduleBuilder() {
     }
   };
 
-  // Request audio permissions
+  // Request audio permissions (native only — on web the browser prompts on getUserMedia)
   useEffect(() => {
+    if (Platform.OS === "web") return;
     (async () => {
       try {
         await Audio.requestPermissionsAsync();
@@ -406,23 +411,131 @@ export default function ScheduleBuilder() {
       const activeRecording = recordingRef.current;
       if (activeRecording) {
         activeRecording.stopAndUnloadAsync().catch(() => {
-          // It's safe to ignore errors here; recording may already be unloaded
           console.log("Recording already unloaded on unmount");
         });
       }
+      // Also tear down any web mic stream that may still be live
+      if (webStreamRef.current) {
+        webStreamRef.current.getTracks().forEach((t) => t.stop());
+        webStreamRef.current = null;
+      }
+      webRecorderRef.current = null;
+      webChunksRef.current = [];
     };
   }, []);
 
-  const startRecording = async () => {
-    try {
-      if (!selectedStep) {
-        Alert.alert("Error", "Please select a step first");
-        return;
+  // Pick the first MIME type the browser actually supports. Pi Chromium
+  // supports webm/opus; other browsers may prefer ogg or mp4.
+  const pickWebRecorderMimeType = () => {
+    if (typeof window === "undefined" || !window.MediaRecorder) return "";
+    const candidates = [
+      "audio/webm;codecs=opus",
+      "audio/webm",
+      "audio/ogg;codecs=opus",
+      "audio/ogg",
+      "audio/mp4",
+      "",
+    ];
+    for (const t of candidates) {
+      if (!t) return ""; // last resort — let the browser pick
+      try {
+        if (window.MediaRecorder.isTypeSupported(t)) return t;
+      } catch {
+        // fall through
       }
+    }
+    return "";
+  };
 
+  const startWebRecording = async () => {
+    if (typeof navigator === "undefined" || !navigator.mediaDevices?.getUserMedia) {
+      Alert.alert(
+        "Recording Not Supported",
+        "This browser does not expose a microphone API. Try a different browser."
+      );
+      return;
+    }
+    if (typeof window === "undefined" || !window.MediaRecorder) {
+      Alert.alert(
+        "Recording Not Supported",
+        "This browser does not support audio recording (MediaRecorder is missing)."
+      );
+      return;
+    }
+
+    let stream;
+    try {
+      stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+    } catch (err) {
+      console.error("getUserMedia failed:", err);
+      const name = err?.name || "";
+      if (name === "NotAllowedError" || name === "SecurityError") {
+        Alert.alert(
+          "Microphone Blocked",
+          "Allow microphone access for this site in your browser settings, then try again."
+        );
+      } else if (name === "NotFoundError" || name === "OverconstrainedError") {
+        Alert.alert(
+          "No Microphone Found",
+          "No microphone is connected. Plug one in and try again."
+        );
+      } else if (name === "NotReadableError") {
+        Alert.alert(
+          "Microphone In Use",
+          "Another app is using the microphone. Close it and try again."
+        );
+      } else {
+        Alert.alert("Recording Error", err?.message || "Could not access the microphone.");
+      }
+      return;
+    }
+
+    try {
+      const mimeType = pickWebRecorderMimeType();
+      const recorder = mimeType
+        ? new window.MediaRecorder(stream, { mimeType })
+        : new window.MediaRecorder(stream);
+
+      webChunksRef.current = [];
+      recorder.ondataavailable = (event) => {
+        if (event.data && event.data.size > 0) {
+          webChunksRef.current.push(event.data);
+        }
+      };
+      recorder.onerror = (event) => {
+        console.error("MediaRecorder error:", event?.error || event);
+        Alert.alert("Recording Error", event?.error?.message || "Recording failed.");
+      };
+
+      webRecorderRef.current = recorder;
+      webStreamRef.current = stream;
+      recorder.start();
+      setIsRecording(true);
+    } catch (err) {
+      console.error("Failed to start MediaRecorder:", err);
+      stream.getTracks().forEach((t) => t.stop());
+      Alert.alert("Recording Error", err?.message || "Could not start recording.");
+    }
+  };
+
+  const startRecording = async () => {
+    if (!selectedStep) {
+      Alert.alert("Error", "Please select a step first");
+      return;
+    }
+
+    if (Platform.OS === "web") {
+      await startWebRecording();
+      return;
+    }
+
+    try {
       const permission = await Audio.requestPermissionsAsync();
       if (permission.status !== "granted") {
-        Alert.alert("Permission Required", "Please grant microphone permission to record audio");
+        Alert.alert(
+          "Permission Required",
+          "Please grant microphone permission to record audio"
+        );
         return;
       }
 
@@ -434,16 +547,64 @@ export default function ScheduleBuilder() {
       const { recording } = await Audio.Recording.createAsync(
         Audio.RecordingOptionsPresets.HIGH_QUALITY
       );
-      
+
       recordingRef.current = recording;
       setIsRecording(true);
     } catch (err) {
       console.error("Failed to start recording:", err);
-      Alert.alert("Error", "Failed to start recording. Please try again.");
+      Alert.alert("Error", err?.message || "Failed to start recording. Please try again.");
+    }
+  };
+
+  const stopWebRecording = async () => {
+    const recorder = webRecorderRef.current;
+    if (!recorder) return;
+
+    const blob = await new Promise((resolve) => {
+      recorder.onstop = () => {
+        const type = recorder.mimeType || "audio/webm";
+        resolve(new Blob(webChunksRef.current, { type }));
+      };
+      try {
+        recorder.stop();
+      } catch (err) {
+        console.error("MediaRecorder.stop() failed:", err);
+        resolve(new Blob(webChunksRef.current, { type: "audio/webm" }));
+      }
+    });
+
+    if (webStreamRef.current) {
+      webStreamRef.current.getTracks().forEach((t) => t.stop());
+      webStreamRef.current = null;
+    }
+    webRecorderRef.current = null;
+    webChunksRef.current = [];
+
+    // Hand the recorded blob to the existing upload path via a blob URL.
+    const uri = URL.createObjectURL(blob);
+    setRecordingUri(uri);
+    setIsRecording(false);
+    await uploadRecordedAudio(uri);
+    // Revoke after upload to free memory.
+    try {
+      URL.revokeObjectURL(uri);
+    } catch {
+      // ignore
     }
   };
 
   const stopRecording = async () => {
+    if (Platform.OS === "web") {
+      try {
+        await stopWebRecording();
+      } catch (err) {
+        console.error("Failed to stop web recording:", err);
+        Alert.alert("Error", err?.message || "Failed to stop recording");
+        setIsRecording(false);
+      }
+      return;
+    }
+
     const activeRecording = recordingRef.current;
     if (!activeRecording) return;
 
@@ -454,7 +615,6 @@ export default function ScheduleBuilder() {
       setRecordingUri(uri);
       recordingRef.current = null;
 
-      // Automatically upload the recording
       if (uri) {
         await uploadRecordedAudio(uri);
       }
